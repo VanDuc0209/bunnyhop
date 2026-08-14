@@ -9,13 +9,18 @@ import (
 type PoolConfig struct {
 	URLs                []string      // Danh sách URLs của các node RabbitMQ
 	ReconnectInterval   time.Duration // Thời gian chờ giữa các lần reconnect
-	MaxReconnectAttempt int           // Số lần thử reconnect tối đa
+	MaxReconnectAttempt int           // Số lần thử reconnect tối đa (0 = unlimited)
 	HealthCheckInterval time.Duration // Thời gian giữa các lần health check
 	Heartbeat           time.Duration // Heartbeat interval
 	ConnectionName      string        // Tên connection hiển thị trên RabbitMQ UI
 	LoadBalanceStrategy LoadBalanceStrategy
 	DebugLog            bool   // Bật/tắt debug log
 	Logger              Logger // Custom logger interface
+
+	// QoS settings for consumers (applied per channel)
+	PrefetchCount  int  // Max unacknowledged messages per consumer. Default: 10
+	PrefetchSize   int  // Max unacknowledged bytes. 0 = no limit
+	PrefetchGlobal bool // Apply to entire connection vs per-channel
 }
 
 // LoadBalanceStrategy chiến lược load balancing

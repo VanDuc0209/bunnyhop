@@ -9,7 +9,9 @@ import (
 	"time"
 )
 
-// Pool quản lý pool các kết nối đến cluster RabbitMQ
+// Pool manages a pool of RabbitMQ connections across multiple nodes.
+// It provides load balancing and automatic failover.
+// Thread-safe for all public methods.
 type Pool struct {
 	config       PoolConfig
 	nodes        []*NodeConnection
@@ -21,12 +23,12 @@ type Pool struct {
 	cancel       context.CancelFunc
 	healthTicker *time.Ticker
 
-	// Metrics
+	// Metrics — updated atomically
 	totalRequests int64
 	totalFailures int64
 }
 
-// NewPool tạo pool mới
+// NewPool creates a new Pool. Call Start() to begin connecting.
 func NewPool(config PoolConfig) *Pool {
 	getDefaultConfig(&config)
 
@@ -40,23 +42,22 @@ func NewPool(config PoolConfig) *Pool {
 		cancel: cancel,
 	}
 
-	// Khởi tạo nodes
 	for i, url := range config.URLs {
 		node := &NodeConnection{
 			URL:      url,
 			Client:   nil,
 			healthy:  false,
-			weight:   1, // Default weight
+			weight:   1,
 			lastUsed: time.Now(),
 		}
 		pool.nodes = append(pool.nodes, node)
-		pool.logger.Debug("Initialized node %d: %s", i, url)
+		pool.logger.Debug("Initialized node %d: %s", i, maskAMQPURL(url))
 	}
 
 	return pool
 }
 
-// Start bắt đầu pool
+// Start begins connecting to all nodes and starts the health check worker.
 func (p *Pool) Start() error {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
@@ -65,12 +66,10 @@ func (p *Pool) Start() error {
 		return fmt.Errorf("pool is closed")
 	}
 
-	// Tạo connection cho mỗi node
 	for _, node := range p.nodes {
 		go p.connectToNode(node)
 	}
 
-	// Bắt đầu health check goroutine
 	p.healthTicker = time.NewTicker(p.config.HealthCheckInterval)
 	go p.healthCheckWorker()
 
@@ -78,18 +77,32 @@ func (p *Pool) Start() error {
 	return nil
 }
 
-// connectToNode tạo connection đến một node
+// connectToNode establishes a connection to a single node.
+// Uses a connecting flag to prevent concurrent duplicate connects to the same node.
 func (p *Pool) connectToNode(node *NodeConnection) {
-	node.mutex.Lock()
-	defer node.mutex.Unlock()
+	// FIX #7: guard — don't connect if pool is closed
+	p.mutex.RLock()
+	if p.closed {
+		p.mutex.RUnlock()
+		return
+	}
+	p.mutex.RUnlock()
 
+	node.mutex.Lock()
 	if node.connecting {
+		node.mutex.Unlock()
 		return
 	}
 	node.connecting = true
-	defer func() { node.connecting = false }()
+	node.mutex.Unlock()
 
-	p.logger.Debug("Connecting to node %s", node.URL)
+	defer func() {
+		node.mutex.Lock()
+		node.connecting = false
+		node.mutex.Unlock()
+	}()
+
+	p.logger.Debug("Connecting to node %s", maskAMQPURL(node.URL))
 
 	client := NewClient(Config{
 		URLs:                []string{node.URL},
@@ -99,62 +112,98 @@ func (p *Pool) connectToNode(node *NodeConnection) {
 		ConnectionName:      p.config.ConnectionName,
 		DebugLog:            p.config.DebugLog,
 		Logger:              p.logger,
+		PrefetchCount:       p.config.PrefetchCount,
+		PrefetchSize:        p.config.PrefetchSize,
+		PrefetchGlobal:      p.config.PrefetchGlobal,
 	})
 
 	err := client.Connect(p.ctx)
+
+	node.mutex.Lock()
+	defer node.mutex.Unlock()
+
 	if err != nil {
-		p.logger.Error("Failed to connect to node %s: %v", node.URL, err)
+		p.logger.Error("Failed to connect to node %s: %v", maskAMQPURL(node.URL), err)
 		atomic.AddInt64(&node.failures, 1)
 		node.healthy = false
 
-		// Thử reconnect sau một khoảng thời gian
-		time.AfterFunc(p.config.ReconnectInterval, func() {
-			p.connectToNode(node)
-		})
+		// FIX #11: ctx-aware goroutine instead of time.AfterFunc — prevents leak after Close()
+		go func() {
+			timer := time.NewTimer(p.config.ReconnectInterval)
+			defer timer.Stop()
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-timer.C:
+				p.connectToNode(node)
+			}
+		}()
 		return
 	}
 
-	// Nếu đã có client cũ, đóng nó
+	// Close old client if one exists (e.g. reconnect replacing stale client)
 	if node.Client != nil {
 		_ = node.Client.Close()
 	}
 
 	node.Client = client
 	node.healthy = true
-	p.logger.Info("Successfully connected to node %s", node.URL)
-
-	// Theo dõi trạng thái connection
-	go p.watchNodeConnection(node)
+	p.logger.Info("Successfully connected to node %s", maskAMQPURL(node.URL))
+	// NOTE: watchNodeConnection removed — health is managed solely by healthCheckWorker
 }
 
-// watchNodeConnection theo dõi trạng thái connection của node
-func (p *Pool) watchNodeConnection(node *NodeConnection) {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
+// healthCheckWorker periodically checks the health of all nodes.
+// FIX #5: single authority for health management — watchNodeConnection has been removed.
+func (p *Pool) healthCheckWorker() {
 	for {
 		select {
 		case <-p.ctx.Done():
 			return
-		case <-ticker.C:
-			node.mutex.RLock()
-			if node.Client != nil && !node.Client.IsConnected() {
-				node.mutex.RUnlock()
-				node.mutex.Lock()
-				node.healthy = false
-				node.mutex.Unlock()
-				p.logger.Warn("Node %s connection lost", node.URL)
-
-				// Tự động reconnect
-				go p.connectToNode(node)
-				return
-			}
-			node.mutex.RUnlock()
+		case <-p.healthTicker.C:
+			p.performHealthCheck()
 		}
 	}
 }
 
-// GetClient lấy một client từ pool theo load balancing strategy
+// performHealthCheck checks all nodes concurrently.
+func (p *Pool) performHealthCheck() {
+	p.logger.Debug("Performing health check on all nodes")
+	for _, node := range p.nodes {
+		go p.checkNodeHealth(node)
+	}
+}
+
+// checkNodeHealth checks a single node and triggers reconnect if needed.
+// FIX #5: this is the single authority — no duplicate watchNodeConnection goroutine.
+func (p *Pool) checkNodeHealth(node *NodeConnection) {
+	node.mutex.Lock()
+	defer node.mutex.Unlock()
+
+	if node.connecting {
+		return // already attempting to connect
+	}
+
+	isConnected := node.Client != nil && node.Client.IsConnected()
+
+	if !isConnected && node.healthy {
+		node.healthy = false
+		p.logger.Warn("Node %s is unhealthy", maskAMQPURL(node.URL))
+	}
+
+	if !isConnected {
+		// Trigger reconnect — connectToNode checks the connecting flag internally
+		go p.connectToNode(node)
+		return
+	}
+
+	if isConnected && !node.healthy {
+		node.healthy = true
+		p.logger.Info("Node %s is now healthy", maskAMQPURL(node.URL))
+	}
+}
+
+// GetClient returns a client from the pool using the configured load balancing strategy.
+// FIX #4: getHealthyNodes no longer calls IsConnected() (I/O) in the hot path.
 func (p *Pool) GetClient() (*Client, error) {
 	atomic.AddInt64(&p.totalRequests, 1)
 
@@ -186,7 +235,6 @@ func (p *Pool) GetClient() (*Client, error) {
 		return nil, err
 	}
 
-	// Update usage stats
 	selectedNode.mutex.Lock()
 	atomic.AddInt64(&selectedNode.totalUsed, 1)
 	selectedNode.lastUsed = time.Now()
@@ -196,88 +244,75 @@ func (p *Pool) GetClient() (*Client, error) {
 	return client, nil
 }
 
-// getClientRoundRobin lựa chọn client theo round robin
 func (p *Pool) getClientRoundRobin() (*NodeConnection, error) {
 	healthyNodes := p.getHealthyNodes()
 	if len(healthyNodes) == 0 {
 		return nil, fmt.Errorf("no healthy nodes available")
 	}
-
 	index := int(atomic.AddInt64(&p.roundRobin, 1)) % len(healthyNodes)
 	return healthyNodes[index], nil
 }
 
-// getClientRandom lựa chọn client ngẫu nhiên
 func (p *Pool) getClientRandom() (*NodeConnection, error) {
 	healthyNodes := p.getHealthyNodes()
 	if len(healthyNodes) == 0 {
 		return nil, fmt.Errorf("no healthy nodes available")
 	}
-
-	index := rand.Intn(len(healthyNodes))
-	return healthyNodes[index], nil
+	return healthyNodes[rand.Intn(len(healthyNodes))], nil
 }
 
-// getClientLeastUsed lựa chọn node ít được sử dụng nhất
 func (p *Pool) getClientLeastUsed() (*NodeConnection, error) {
 	healthyNodes := p.getHealthyNodes()
 	if len(healthyNodes) == 0 {
 		return nil, fmt.Errorf("no healthy nodes available")
 	}
 
-	var selectedNode *NodeConnection
-	minUsed := int64(^uint64(0) >> 1) // Max int64
-
+	var selected *NodeConnection
+	minUsed := int64(^uint64(0) >> 1)
 	for _, node := range healthyNodes {
 		used := atomic.LoadInt64(&node.totalUsed)
 		if used < minUsed {
 			minUsed = used
-			selectedNode = node
+			selected = node
 		}
 	}
-
-	return selectedNode, nil
+	return selected, nil
 }
 
-// getClientWeightedRoundRobin lựa chọn theo weighted round robin
 func (p *Pool) getClientWeightedRoundRobin() (*NodeConnection, error) {
 	healthyNodes := p.getHealthyNodes()
 	if len(healthyNodes) == 0 {
 		return nil, fmt.Errorf("no healthy nodes available")
 	}
 
-	// Tính tổng weight
 	totalWeight := 0
 	for _, node := range healthyNodes {
 		totalWeight += node.weight
 	}
-
 	if totalWeight == 0 {
-		// Fallback to round robin
 		return p.getClientRoundRobin()
 	}
 
-	// Random selection based on weight
 	randWeight := rand.Intn(totalWeight)
-	currentWeight := 0
-
+	current := 0
 	for _, node := range healthyNodes {
-		currentWeight += node.weight
-		if randWeight < currentWeight {
+		current += node.weight
+		if randWeight < current {
 			return node, nil
 		}
 	}
-
-	// Fallback to first healthy node
 	return healthyNodes[0], nil
 }
 
-// getHealthyNodes trả về danh sách nodes đang healthy
+// getHealthyNodes returns all nodes marked as healthy.
+// FIX #4: reads only the cached node.healthy bool — no I/O calls in the hot path.
+// node.healthy is updated exclusively by checkNodeHealth() in the background.
 func (p *Pool) getHealthyNodes() []*NodeConnection {
 	var healthyNodes []*NodeConnection
 	for _, node := range p.nodes {
 		node.mutex.RLock()
-		if node.healthy && node.Client != nil && node.Client.IsConnected() {
+		// Only read the cached bool — do NOT call IsConnected() here (I/O, nested lock)
+		if node.healthy && node.Client != nil {
 			healthyNodes = append(healthyNodes, node)
 		}
 		node.mutex.RUnlock()
@@ -285,78 +320,27 @@ func (p *Pool) getHealthyNodes() []*NodeConnection {
 	return healthyNodes
 }
 
-// healthCheckWorker worker để thực hiện health check định kỳ
-func (p *Pool) healthCheckWorker() {
-	for {
-		select {
-		case <-p.ctx.Done():
-			return
-		case <-p.healthTicker.C:
-			p.performHealthCheck()
-		}
-	}
-}
-
-// performHealthCheck thực hiện health check cho tất cả nodes
-func (p *Pool) performHealthCheck() {
-	p.logger.Debug("Performing health check on all nodes")
-
-	for _, node := range p.nodes {
-		go p.checkNodeHealth(node)
-	}
-}
-
-// checkNodeHealth kiểm tra health của một node
-func (p *Pool) checkNodeHealth(node *NodeConnection) {
-	node.mutex.Lock()
-	defer node.mutex.Unlock()
-
-	if node.Client == nil {
-		node.healthy = false
-		p.logger.Debug("Node %s has no client", node.URL)
-
-		// Thử tạo connection
-		go p.connectToNode(node)
-		return
-	}
-
-	// Kiểm tra connection
-	if !node.Client.IsConnected() {
-		node.healthy = false
-		p.logger.Debug("Node %s connection is not healthy", node.URL)
-
-		// Thử reconnect
-		go p.connectToNode(node)
-		return
-	}
-
-	// Node đang healthy
-	if !node.healthy {
-		node.healthy = true
-		p.logger.Info("Node %s is now healthy", node.URL)
-	}
-}
-
-// GetStats lấy thống kê của pool
+// GetStats returns pool statistics.
+// FIX #6: does not call IsConnected() (nested lock → deadlock risk). Uses cached node.healthy.
 func (p *Pool) GetStats() PoolStats {
 	p.mutex.RLock()
 	defer p.mutex.RUnlock()
 
 	stats := PoolStats{
 		TotalNodes:    len(p.nodes),
-		TotalRequests: p.totalRequests,
-		TotalFailures: p.totalFailures,
+		TotalRequests: atomic.LoadInt64(&p.totalRequests),
+		TotalFailures: atomic.LoadInt64(&p.totalFailures),
 		NodesStats:    make([]NodeStats, 0, len(p.nodes)),
 	}
 
 	for _, node := range p.nodes {
 		node.mutex.RLock()
 		nodeStat := NodeStats{
-			URL:       node.URL,
+			URL:       maskAMQPURL(node.URL), // SECURITY: mask credentials
 			Healthy:   node.healthy,
-			Connected: node.Client != nil && node.Client.IsConnected(),
-			TotalUsed: node.totalUsed,
-			Failures:  node.failures,
+			Connected: node.healthy, // cached state — avoids nested lock / I/O
+			TotalUsed: atomic.LoadInt64(&node.totalUsed),
+			Failures:  atomic.LoadInt64(&node.failures),
 			Weight:    node.weight,
 			LastUsed:  node.lastUsed.Format(time.RFC3339),
 		}
@@ -365,40 +349,44 @@ func (p *Pool) GetStats() PoolStats {
 		if nodeStat.Healthy {
 			stats.HealthyNodes++
 		}
-
 		stats.NodesStats = append(stats.NodesStats, nodeStat)
 	}
 
 	return stats
 }
 
-// Close đóng pool
+// Close shuts down the pool: stops health checks, cancels goroutines, closes all clients.
+// FIX #7: cancels context first (stops AfterFunc goroutines), then closes clients.
 func (p *Pool) Close() error {
 	p.mutex.Lock()
-	defer p.mutex.Unlock()
-
 	if p.closed {
+		p.mutex.Unlock()
 		return nil
 	}
-
 	p.closed = true
+	p.mutex.Unlock()
 
-	// Hủy context
+	// Cancel context first — stops healthCheckWorker and all ctx-aware goroutines
 	if p.cancel != nil {
 		p.cancel()
 	}
-
-	// Dừng health check
 	if p.healthTicker != nil {
 		p.healthTicker.Stop()
 	}
 
-	// Đóng tất cả nodes
+	// Brief wait to allow goroutines to observe ctx.Done()
+	time.Sleep(50 * time.Millisecond)
+
 	var errs []error
 	for _, node := range p.nodes {
-		if node.Client != nil {
-			if err := node.Client.Close(); err != nil {
-				errs = append(errs, fmt.Errorf("failed to close node %s: %v", node.URL, err))
+		node.mutex.Lock()
+		client := node.Client
+		node.Client = nil // prevent double-close by any lingering goroutine
+		node.mutex.Unlock()
+
+		if client != nil {
+			if err := client.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("node %s: %v", maskAMQPURL(node.URL), err))
 			}
 		}
 	}
@@ -408,11 +396,10 @@ func (p *Pool) Close() error {
 	if len(errs) > 0 {
 		return fmt.Errorf("errors during close: %v", errs)
 	}
-
 	return nil
 }
 
-// SetNodeWeight thiết lập weight cho một node
+// SetNodeWeight sets the weight for a node used in WeightedRoundRobin strategy.
 func (p *Pool) SetNodeWeight(url string, weight int) error {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
@@ -422,15 +409,14 @@ func (p *Pool) SetNodeWeight(url string, weight int) error {
 			node.mutex.Lock()
 			node.weight = weight
 			node.mutex.Unlock()
-			p.logger.Info("Set weight for node %s to %d", url, weight)
+			p.logger.Info("Set weight for node %s to %d", maskAMQPURL(url), weight)
 			return nil
 		}
 	}
-
-	return fmt.Errorf("node not found: %s", url)
+	return fmt.Errorf("node not found: %s", maskAMQPURL(url))
 }
 
-// GetHealthyNodeCount trả về số lượng nodes đang healthy
+// GetHealthyNodeCount returns the number of currently healthy nodes.
 func (p *Pool) GetHealthyNodeCount() int {
 	p.mutex.RLock()
 	defer p.mutex.RUnlock()
@@ -438,7 +424,7 @@ func (p *Pool) GetHealthyNodeCount() int {
 	count := 0
 	for _, node := range p.nodes {
 		node.mutex.RLock()
-		if node.healthy && node.Client != nil && node.Client.IsConnected() {
+		if node.healthy && node.Client != nil {
 			count++
 		}
 		node.mutex.RUnlock()
