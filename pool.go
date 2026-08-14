@@ -95,6 +95,8 @@ func (p *Pool) connectToNode(node *NodeConnection) {
 		URLs:                []string{node.URL},
 		ReconnectInterval:   p.config.ReconnectInterval,
 		MaxReconnectAttempt: p.config.MaxReconnectAttempt,
+		Heartbeat:           p.config.Heartbeat,
+		ConnectionName:      p.config.ConnectionName,
 		DebugLog:            p.config.DebugLog,
 		Logger:              p.logger,
 	})
@@ -114,7 +116,7 @@ func (p *Pool) connectToNode(node *NodeConnection) {
 
 	// Nếu đã có client cũ, đóng nó
 	if node.Client != nil {
-		node.Client.Close()
+		_ = node.Client.Close()
 	}
 
 	node.Client = client

@@ -14,8 +14,35 @@ type Config struct {
 	URLs                []string      // Danh sách URLs của RabbitMQ
 	ReconnectInterval   time.Duration // Thời gian chờ giữa các lần reconnect
 	MaxReconnectAttempt int           // Số lần thử reconnect tối đa
+	Heartbeat           time.Duration // Heartbeat interval (mặc định 10s)
+	ConnectionName      string        // Tên connection hiển thị trên RabbitMQ UI
 	DebugLog            bool          // Bật/tắt debug log
 	Logger              Logger        // Custom logger interface
+}
+
+type exchangeMeta struct {
+	name       string
+	kind       string
+	durable    bool
+	autoDelete bool
+	internal   bool
+	args       amqp.Table
+}
+
+type queueMeta struct {
+	name       string
+	durable    bool
+	autoDelete bool
+	exclusive  bool
+	args       amqp.Table
+}
+
+type bindMeta struct {
+	name     string
+	key      string
+	exchange string
+	noWait   bool
+	args     amqp.Table
 }
 
 // Client quản lý kết nối đến RabbitMQ
@@ -24,20 +51,27 @@ type Client struct {
 	connection        *amqp.Connection
 	channel           *amqp.Channel
 	mutex             sync.RWMutex
+	publishMutex      sync.Mutex // Bảo vệ channel khi publish đồng thời từ nhiều goroutine
 	connected         bool
 	reconnectAttempts int
 	ctx               context.Context
 	cancel            context.CancelFunc
-	reconnectTicker   *time.Ticker
-	connectionErrors  chan *amqp.Error
-	channelErrors     chan *amqp.Error
+	workerCancel      context.CancelFunc // Hủy worker cũ khi reconnect để tránh rò rỉ goroutine
 	reconnecting      bool
+
+	// Metadata lưu lại để tự động khai báo lại khi reconnect
+	declaredExchanges []exchangeMeta
+	declaredQueues    []queueMeta
+	boundQueues       []bindMeta
 }
 
 // NewClient tạo client mới
 func NewClient(config Config) *Client {
-	if config.ReconnectInterval == 0 {
-		config.ReconnectInterval = 30 * time.Second
+	if config.ReconnectInterval <= 0 {
+		config.ReconnectInterval = 5 * time.Second
+	}
+	if config.Heartbeat <= 0 {
+		config.Heartbeat = 10 * time.Second
 	}
 	if config.Logger == nil {
 		config.Logger = NewDefaultLogger(config.DebugLog)
@@ -46,12 +80,12 @@ func NewClient(config Config) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Client{
-		config:           config,
-		ctx:              ctx,
-		cancel:           cancel,
-		connectionErrors: make(chan *amqp.Error, 1),
-		channelErrors:    make(chan *amqp.Error, 1),
-		reconnecting:     false,
+		config:            config,
+		ctx:               ctx,
+		cancel:            cancel,
+		declaredExchanges: make([]exchangeMeta, 0),
+		declaredQueues:    make([]queueMeta, 0),
+		boundQueues:       make([]bindMeta, 0),
 	}
 }
 
@@ -66,7 +100,6 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	c.logger().Debug("Connecting to RabbitMQ...")
 
-	// Thử kết nối đến từng URL
 	var lastErr error
 	for _, url := range c.config.URLs {
 		if err := c.connectToURL(url); err != nil {
@@ -83,73 +116,87 @@ func (c *Client) Connect(ctx context.Context) error {
 
 // connectToURL kết nối đến một URL cụ thể
 func (c *Client) connectToURL(url string) error {
-	// Tạo connection
-	conn, err := amqp.Dial(url)
-	if err != nil {
-		return fmt.Errorf("failed to dial: %v", err)
+	props := amqp.NewConnectionProperties()
+	if c.config.ConnectionName != "" {
+		props.SetClientConnectionName(c.config.ConnectionName)
 	}
 
-	// Tạo channel
+	amqpCfg := amqp.Config{
+		Heartbeat:  c.config.Heartbeat,
+		Properties: props,
+		Locale:     "en_US",
+	}
+
+	conn, err := amqp.DialConfig(url, amqpCfg)
+	if err != nil {
+		return fmt.Errorf("failed to dial: %w", err)
+	}
+
 	ch, err := conn.Channel()
 	if err != nil {
-		conn.Close()
-		return fmt.Errorf("failed to open channel: %v", err)
+		_ = conn.Close()
+		return fmt.Errorf("failed to open channel: %w", err)
 	}
 
-	// Thiết lập QoS
-	err = ch.Qos(
-		1,     // prefetch count
-		0,     // prefetch size
-		false, // global
-	)
-	if err != nil {
-		ch.Close()
-		conn.Close()
-		return fmt.Errorf("failed to set QoS: %v", err)
+	if err := ch.Qos(1, 0, false); err != nil {
+		_ = ch.Close()
+		_ = conn.Close()
+		return fmt.Errorf("failed to set QoS: %w", err)
 	}
 
-	// Lưu connection và channel
+	// Hủy worker cũ (nếu có) để tránh rò rỉ goroutine
+	if c.workerCancel != nil {
+		c.workerCancel()
+	}
+	workerCtx, workerCancel := context.WithCancel(c.ctx)
+	c.workerCancel = workerCancel
+
 	c.connection = conn
 	c.channel = ch
 	c.connected = true
 	c.reconnectAttempts = 0
 	c.reconnecting = false
 
-	// Thiết lập error handlers
-	c.setupErrorHandlers()
+	// Tự động re-declare lại Exchange / Queue / Binding đã đăng ký trước đó
+	for _, ex := range c.declaredExchanges {
+		if err := ch.ExchangeDeclare(ex.name, ex.kind, ex.durable, ex.autoDelete, ex.internal, false, ex.args); err != nil {
+			c.logger().Warn("Failed to re-declare exchange %s: %v", ex.name, err)
+		}
+	}
+	for _, q := range c.declaredQueues {
+		if _, err := ch.QueueDeclare(q.name, q.durable, q.autoDelete, q.exclusive, false, q.args); err != nil {
+			c.logger().Warn("Failed to re-declare queue %s: %v", q.name, err)
+		}
+	}
+	for _, b := range c.boundQueues {
+		if err := ch.QueueBind(b.name, b.key, b.exchange, b.noWait, b.args); err != nil {
+			c.logger().Warn("Failed to re-bind queue %s to %s: %v", b.name, b.exchange, err)
+		}
+	}
 
-	// Bắt đầu reconnect goroutine
-	go c.reconnectWorker()
+	// Lắng nghe lỗi đóng kết nối
+	connCloseChan := conn.NotifyClose(make(chan *amqp.Error, 1))
+	chCloseChan := ch.NotifyClose(make(chan *amqp.Error, 1))
+
+	go c.reconnectWorker(workerCtx, connCloseChan, chCloseChan)
 
 	return nil
 }
 
-// setupErrorHandlers thiết lập xử lý lỗi
-func (c *Client) setupErrorHandlers() {
-	if c.connection != nil {
-		c.connectionErrors = c.connection.NotifyClose(make(chan *amqp.Error, 1))
-	}
-	if c.channel != nil {
-		c.channelErrors = c.channel.NotifyClose(make(chan *amqp.Error, 1))
-	}
-}
-
-// reconnectWorker xử lý reconnect tự động
-func (c *Client) reconnectWorker() {
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		case err := <-c.connectionErrors:
-			if err != nil {
-				c.logger().Error("Connection error: %v", err)
-				c.handleDisconnection()
-			}
-		case err := <-c.channelErrors:
-			if err != nil {
-				c.logger().Error("Channel error: %v", err)
-				c.handleDisconnection()
-			}
+// reconnectWorker xử lý theo dõi lỗi đóng kết nối
+func (c *Client) reconnectWorker(ctx context.Context, connClose, chClose chan *amqp.Error) {
+	select {
+	case <-ctx.Done():
+		return
+	case err, ok := <-connClose:
+		if ok && err != nil {
+			c.logger().Error("RabbitMQ Connection error: %v", err)
+			c.handleDisconnection()
+		}
+	case err, ok := <-chClose:
+		if ok && err != nil {
+			c.logger().Error("RabbitMQ Channel error: %v", err)
+			c.handleDisconnection()
 		}
 	}
 }
@@ -157,7 +204,6 @@ func (c *Client) reconnectWorker() {
 // handleDisconnection xử lý khi mất kết nối
 func (c *Client) handleDisconnection() {
 	c.mutex.Lock()
-	// Kiểm tra xem đã đang reconnect chưa
 	if c.reconnecting {
 		c.mutex.Unlock()
 		return
@@ -167,15 +213,12 @@ func (c *Client) handleDisconnection() {
 	c.mutex.Unlock()
 
 	c.logger().Warn("Connection lost, attempting to reconnect...")
-
-	// Thử reconnect
 	go c.reconnect()
 }
 
 // reconnect thực hiện reconnect
 func (c *Client) reconnect() {
 	c.mutex.Lock()
-
 	if c.connected {
 		c.reconnecting = false
 		c.mutex.Unlock()
@@ -192,24 +235,21 @@ func (c *Client) reconnect() {
 
 	c.logger().Info("Reconnection attempt %d/%d", c.reconnectAttempts, c.config.MaxReconnectAttempt)
 
-	// Đóng connection cũ nếu có
-	if c.connection != nil {
-		c.connection.Close()
-		c.connection = nil
-	}
 	if c.channel != nil {
-		c.channel.Close()
+		_ = c.channel.Close()
 		c.channel = nil
 	}
-
+	if c.connection != nil {
+		_ = c.connection.Close()
+		c.connection = nil
+	}
 	c.mutex.Unlock()
-	// Chờ một chút trước khi thử lại
+
 	time.Sleep(c.config.ReconnectInterval)
-	// Thử kết nối lại
+
 	if err := c.Connect(c.ctx); err != nil {
 		c.logger().Error("Reconnection failed: %v", err)
-		// Thử lại sau một khoảng thời gian
-		time.AfterFunc(c.config.ReconnectInterval, c.reconnect)
+		go c.reconnect()
 	}
 }
 
@@ -237,7 +277,7 @@ func (c *Client) GetConnection() (*amqp.Connection, error) {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
-	if !c.connected || c.connection != nil || c.connection.IsClosed() {
+	if !c.connected || c.connection == nil || c.connection.IsClosed() {
 		return nil, fmt.Errorf("client is not connected")
 	}
 
@@ -250,23 +290,20 @@ func (c *Client) Close() error {
 	defer c.mutex.Unlock()
 
 	c.cancel()
-
-	if c.reconnectTicker != nil {
-		c.reconnectTicker.Stop()
+	if c.workerCancel != nil {
+		c.workerCancel()
 	}
 
 	var errs []error
-
 	if c.channel != nil {
 		if err := c.channel.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close channel: %v", err))
+			errs = append(errs, fmt.Errorf("failed to close channel: %w", err))
 		}
 		c.channel = nil
 	}
-
 	if c.connection != nil {
 		if err := c.connection.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close connection: %v", err))
+			errs = append(errs, fmt.Errorf("failed to close connection: %w", err))
 		}
 		c.connection = nil
 	}
@@ -292,10 +329,16 @@ func (c *Client) PublishMessage(
 	mandatory, immediate bool,
 	msg amqp.Publishing,
 ) error {
-	ch, err := c.GetChannel()
-	if err != nil {
-		return err
+	c.mutex.RLock()
+	if !c.connected || c.channel == nil {
+		c.mutex.RUnlock()
+		return fmt.Errorf("client is not connected")
 	}
+	ch := c.channel
+	c.mutex.RUnlock()
+
+	c.publishMutex.Lock()
+	defer c.publishMutex.Unlock()
 
 	return ch.Publish(exchange, routingKey, mandatory, immediate, msg)
 }
@@ -306,12 +349,22 @@ func (c *Client) DeclareQueue(
 	durable, autoDelete, exclusive bool,
 	args amqp.Table,
 ) (amqp.Queue, error) {
-	ch, err := c.GetChannel()
-	if err != nil {
-		return amqp.Queue{}, err
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if !c.connected || c.channel == nil {
+		return amqp.Queue{}, fmt.Errorf("client is not connected")
 	}
 
-	return ch.QueueDeclare(name, durable, autoDelete, exclusive, false, args)
+	c.declaredQueues = append(c.declaredQueues, queueMeta{
+		name:       name,
+		durable:    durable,
+		autoDelete: autoDelete,
+		exclusive:  exclusive,
+		args:       args,
+	})
+
+	return c.channel.QueueDeclare(name, durable, autoDelete, exclusive, false, args)
 }
 
 // DeclareExchange khai báo exchange
@@ -320,20 +373,41 @@ func (c *Client) DeclareExchange(
 	durable, autoDelete, internal bool,
 	args amqp.Table,
 ) error {
-	ch, err := c.GetChannel()
-	if err != nil {
-		return err
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if !c.connected || c.channel == nil {
+		return fmt.Errorf("client is not connected")
 	}
 
-	return ch.ExchangeDeclare(name, kind, durable, autoDelete, internal, false, args)
+	c.declaredExchanges = append(c.declaredExchanges, exchangeMeta{
+		name:       name,
+		kind:       kind,
+		durable:    durable,
+		autoDelete: autoDelete,
+		internal:   internal,
+		args:       args,
+	})
+
+	return c.channel.ExchangeDeclare(name, kind, durable, autoDelete, internal, false, args)
 }
 
 // QueueBind bind queue với exchange
 func (c *Client) QueueBind(name, key, exchange string, noWait bool, args amqp.Table) error {
-	ch, err := c.GetChannel()
-	if err != nil {
-		return err
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if !c.connected || c.channel == nil {
+		return fmt.Errorf("client is not connected")
 	}
 
-	return ch.QueueBind(name, key, exchange, noWait, args)
+	c.boundQueues = append(c.boundQueues, bindMeta{
+		name:     name,
+		key:      key,
+		exchange: exchange,
+		noWait:   noWait,
+		args:     args,
+	})
+
+	return c.channel.QueueBind(name, key, exchange, noWait, args)
 }

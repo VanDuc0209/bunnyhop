@@ -11,6 +11,8 @@ type PoolConfig struct {
 	ReconnectInterval   time.Duration // Thời gian chờ giữa các lần reconnect
 	MaxReconnectAttempt int           // Số lần thử reconnect tối đa
 	HealthCheckInterval time.Duration // Thời gian giữa các lần health check
+	Heartbeat           time.Duration // Heartbeat interval
+	ConnectionName      string        // Tên connection hiển thị trên RabbitMQ UI
 	LoadBalanceStrategy LoadBalanceStrategy
 	DebugLog            bool   // Bật/tắt debug log
 	Logger              Logger // Custom logger interface
